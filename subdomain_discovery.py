@@ -3,12 +3,11 @@ import json
 import dns.resolver
 import dns.zone
 import dns.query
-import dns.reversename
 import os
 import sys
+import time
 
-
-def get_subdomains_from_dns(domain, nameserver="8.8.8.8"):
+def get_subdomains_from_dns(domain, nameserver="8.8.8.8", timeout=5):
     """
     Базовый метод, который пытается:
     1. Получить субдомены через AXFR (если открыт).
@@ -16,12 +15,13 @@ def get_subdomains_from_dns(domain, nameserver="8.8.8.8"):
     3. Проверить MX-записи.
     Возвращает set субдоменов (без дубликатов).
     """
-    subdomains = set()  # используем set, чтобы исключить дубли сразу
+    subdomains = set()
     try:
         resolver = dns.resolver.Resolver()
         resolver.nameservers = [nameserver]
+        resolver.timeout = timeout
+        resolver.lifetime = timeout
 
-        # Запрашиваем записи NS для домена
         try:
             ns_records = resolver.resolve(domain, "NS")
         except dns.resolver.NoNameservers:
@@ -34,17 +34,15 @@ def get_subdomains_from_dns(domain, nameserver="8.8.8.8"):
         ns_servers = [str(ns.target).rstrip('.') for ns in ns_records]
         print(f"NS Servers for {domain}: {ns_servers}")
 
-        # Пробуем AXFR (зонный трансфер) для каждого NS
         for ns in ns_servers:
             try:
-                zone_transfer = dns.query.xfr(ns, domain)
+                zone_transfer = dns.query.xfr(ns, domain, timeout=timeout)
                 zone = dns.zone.from_xfr(zone_transfer)
                 for name, _ in zone.nodes.items():
                     subdomains.add(f"{name}.{domain}")
                 if subdomains:
                     print("AXFR-зона получена (частично или полностью).")
             except dns.exception.FormError:
-                # AXFR не разрешён
                 pass
             except Exception as e:
                 print(f"Ошибка при AXFR-запросе к {ns}: {e}")
@@ -52,7 +50,6 @@ def get_subdomains_from_dns(domain, nameserver="8.8.8.8"):
         if not subdomains:
             print("AXFR-зона закрыта или не даёт результата. Переходим к wildcard-запросам.")
 
-            # Проверка wildcard (TXT) записей
             try:
                 txt_records = resolver.resolve(f"*.{domain}", "TXT")
                 if txt_records:
@@ -61,7 +58,6 @@ def get_subdomains_from_dns(domain, nameserver="8.8.8.8"):
             except Exception:
                 print("Wildcard TXT-записи не найдены.")
 
-            # Проверка MX-записей (иногда указывает на субдомены)
             try:
                 mx_records = resolver.resolve(domain, "MX")
                 for mx in mx_records:
@@ -84,50 +80,64 @@ def get_subdomains_from_crtsh(domain):
     """
     url = f"https://crt.sh/?q={domain}&output=json"
     subdomains = set()
-    try:
-        r = requests.get(url, timeout=10)
-        if r.status_code == 200:
-            data = json.loads(r.text)
-            for entry in data:
-                name_value = entry.get('name_value', '')
-                for line in name_value.splitlines():
-                    clean_name = line.replace('*.', '').lower().strip()
-                    if clean_name.endswith(domain.lower()):
-                        subdomains.add(clean_name)
-        else:
-            print(f"Неожиданный код ответа от crt.sh: {r.status_code}")
-    except Exception as e:
-        print(f"Ошибка при запросе к crt.sh: {e}")
+    max_retries = 3
+    retry_delay = 5
+    
+    for attempt in range(max_retries):
+        try:
+            r = requests.get(url, timeout=10)
+            if r.status_code == 200:
+                try:
+                    data = json.loads(r.text)
+                    if not data:
+                        print("crt.sh вернул пустой ответ")
+                        break
+                        
+                    for entry in data:
+                        name_value = entry.get('name_value', '')
+                        for line in name_value.splitlines():
+                            clean_name = line.replace('*.', '').lower().strip()
+                            if clean_name and clean_name.endswith(domain.lower()):
+                                subdomains.add(clean_name)
+                    break
+                except json.JSONDecodeError:
+                    print("Ошибка декодирования JSON от crt.sh")
+                    break
+            else:
+                print(f"Неожиданный код ответа от crt.sh: {r.status_code}")
+                if attempt < max_retries - 1:
+                    print(f"Повторная попытка через {retry_delay} сек... (попытка {attempt + 2}/{max_retries})")
+                    time.sleep(retry_delay)
+                    
+        except Exception as e:
+            print(f"Ошибка при запросе к crt.sh: {e}")
+            if attempt < max_retries - 1:
+                print(f"Повторная попытка через {retry_delay} сек... (попытка {attempt + 2}/{max_retries})")
+                time.sleep(retry_delay)
     return subdomains
 
 if __name__ == '__main__':
     domain = input("Введите домен: ").strip()
 
-    # Сначала пробуем DNS-способ
     dns_subs = get_subdomains_from_dns(domain)
     print(f"\n[DNS] Найдено {len(dns_subs)} субдоменов:")
     for s in sorted(dns_subs):
         print(f"  {s}")
 
-    # Дополняем сертификатами
     crtsh_subs = get_subdomains_from_crtsh(domain)
     print(f"\n[crt.sh] Найдено {len(crtsh_subs)} субдоменов:")
     for s in sorted(crtsh_subs):
         print(f"  {s}")
 
-    # Объединяем
     all_subdomains = sorted(dns_subs.union(crtsh_subs))
     print(f"\nИтого уникальных субдоменов: {len(all_subdomains)}")
     for s in all_subdomains:
         print(f"  {s}")
 
-    # Вычисляем путь к файлу рядом со скриптом
-    # Получаем путь до текущего .py
     script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
     output_filename = f"{domain}.txt"
     full_path = os.path.join(script_dir, output_filename)
 
-    # Записываем в файл <домен>.txt, рядом со скриптом
     try:
         with open(full_path, "w", encoding="utf-8") as f:
             for sub in all_subdomains:
