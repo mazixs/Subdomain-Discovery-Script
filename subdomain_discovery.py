@@ -6,7 +6,7 @@ import dns.asyncresolver
 import dns.asyncquery
 import os
 import sys
-import time # Keep for potential sync parts, though asyncio.sleep is preferred
+# import time # Removed unused import
 import argparse
 import asyncio
 import aiohttp # For async HTTP requests
